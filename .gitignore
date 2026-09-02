@@ -1,0 +1,16 @@
+# 运行产物不入库
+logs/
+*.pid
+*.log
+*.log.prev
+*.log.old
+
+# 构建产物
+bin/
+obj/
+*.user
+
+# 发布物（GitHub 仓库独立维护）
+github-repo/
+package-src/
+release/
