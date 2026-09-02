@@ -173,7 +173,9 @@ namespace DshLauncher
         private static bool SendCommand(string cmd)
         {
             string name = PipeNameBase + "-" + Environment.UserName;
-            for (int i = 0; i < 5; i++)
+            // 超时收紧 (修 2026-09-03 #2): 本机命名管道正常毫秒级连上, 旧 3s×5≈17.5s 的失败重试
+            // 让 fallback 触发延迟过长, 撞上调用方超时窗口。压到 800ms×3≈3.9s, fallback 秒级触达。
+            for (int i = 0; i < 3; i++)
             {
                 try
                 {
@@ -182,14 +184,14 @@ namespace DshLauncher
                     //  命令被丢弃且 fallback 分支永远进不去)
                     using (NamedPipeClientStream client = new NamedPipeClientStream(".", name, PipeDirection.InOut))
                     {
-                        client.Connect(3000);
+                        client.Connect(800);
                         using (StreamWriter writer = new StreamWriter(client, Encoding.UTF8))
                         using (StreamReader reader = new StreamReader(client, Encoding.UTF8))
                         {
                             writer.WriteLine(cmd);
                             writer.Flush();
                             // 读 ACK, 带超时保护(ReadToEnd 会阻塞到对端关连接, 用 Read 逐字节+超时)
-                            string ack = ReadLineWithTimeout(reader, 3000);
+                            string ack = ReadLineWithTimeout(reader, 2000);
                             if (ack == "ACK") return true;
                             LauncherLog.Write("SendCommand 未收到 ACK (cmd=" + cmd + ", 收到: " + (ack ?? "null") + ")");
                         }
