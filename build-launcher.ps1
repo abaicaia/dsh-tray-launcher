@@ -132,21 +132,36 @@ $w.Flush()
 $w.Dispose(); $ms.Dispose()
 Write-Host "[2/5] icon: $ico ($((Get-Item $ico).Length) bytes)"
 
-# --- 3. source must be UTF-8 WITH BOM, otherwise csc decodes Chinese as GBK ---
-$bytes = [IO.File]::ReadAllBytes($src)
-if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) {
-    $bytes = $bytes[3..($bytes.Length - 1)]
-}
+# --- 3. sources must be UTF-8 WITH BOM, otherwise csc decodes Chinese as GBK ---
+# v1.1: 编译源 = 主程序 + 拆分出的模块文件（全部转 BOM 后传入 csc）
+$sourceFiles = @(
+    (Join-Path $scriptDir 'DshLauncher.cs'),
+    (Join-Path $scriptDir 'LauncherConfig.cs'),
+    (Join-Path $scriptDir 'LauncherLog.cs'),
+    (Join-Path $scriptDir 'LauncherCore.cs'),
+    (Join-Path $scriptDir 'ModeGate.cs')
+)
+$tmpSources = @()
 $bom = [byte[]](0xEF, 0xBB, 0xBF)
-$tmpSrc = Join-Path $env:TEMP ('DshLauncher-' + [guid]::NewGuid().ToString('N') + '.cs')
-[IO.File]::WriteAllBytes($tmpSrc, $bom + $bytes)
-Write-Host "[3/5] source prepared (UTF-8 BOM): $tmpSrc"
+foreach ($f in $sourceFiles) {
+    if (-not (Test-Path $f)) { throw "source not found: $f" }
+    $bytes = [IO.File]::ReadAllBytes($f)
+    if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) {
+        $bytes = $bytes[3..($bytes.Length - 1)]
+    }
+    $tmp = Join-Path $env:TEMP ('DshLauncher-' + [guid]::NewGuid().ToString('N') + '-' + [IO.Path]::GetFileName($f))
+    [IO.File]::WriteAllBytes($tmp, $bom + $bytes)
+    $tmpSources += $tmp
+}
+Write-Host "[3/5] sources prepared (UTF-8 BOM): $($tmpSources.Count) files"
 
 # --- 4. compile ---
-& $csc /nologo /target:winexe /optimize+ "/win32icon:$ico" "/out:$out" "$tmpSrc" "$asminfo" `
-    /r:System.Windows.Forms.dll /r:System.Drawing.dll /r:System.Management.dll /r:System.Core.dll
+$cscArgs = @(
+    '/nologo', '/target:winexe', '/optimize+', "/win32icon:$ico", "/out:$out"
+) + $tmpSources + @($asminfo, '/r:System.Windows.Forms.dll', '/r:System.Drawing.dll', '/r:System.Management.dll', '/r:System.Core.dll')
+& $csc $cscArgs
 if ($LASTEXITCODE -ne 0) { throw "csc failed with exit code $LASTEXITCODE" }
-Remove-Item $tmpSrc -ErrorAction SilentlyContinue
+foreach ($t in $tmpSources) { Remove-Item $t -ErrorAction SilentlyContinue }
 Write-Host "[4/5] compiled: $out ($((Get-Item $out).Length) bytes)"
 
 # --- 5. install / repoint desktop shortcuts ---

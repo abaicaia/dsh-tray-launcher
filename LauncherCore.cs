@@ -1,0 +1,565 @@
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using System.Management;
+using System.Net;
+using System.Net.NetworkInformation;
+using System.Text;
+using System.Text.RegularExpressions;
+using System.Threading;
+using System.Windows.Forms;
+
+namespace DshLauncher
+{
+    /// <summary>
+    /// DSH 进程与界面核心操作：探测、进程治理、启停、打开界面、开机自启、一次性命令、诊断报告。
+    /// v1.1 重构：从 Program 原样搬出（行为零变化）。
+    /// 供托盘/命令表调用；本类不持有 UI 状态（图标/菜单在 Program）。
+    /// </summary>
+    internal static class LauncherCore
+    {
+        // 启停成功后由托盘更新的提示位（原 _lastUp 语义保留在 Program）
+        // ---------------- 探测 ----------------
+
+        public static bool TcpListening(int port)
+        {
+            try
+            {
+                IPEndPoint[] listeners = IPGlobalProperties.GetIPGlobalProperties().GetActiveTcpListeners();
+                foreach (IPEndPoint l in listeners)
+                    if (l.Port == port) return true;
+            }
+            catch { }
+            return false;
+        }
+
+        /// <summary>
+        /// 全检: HTTP 可达性。兼容 v1.0（无认证, 200 页面含 __DSH_BOOT__）与
+        /// 0.1.2-alpha+（token 认证, 无 token 返回 401）。
+        /// 判定: 能拿到任何 HTTP 响应（200/401/403…）都视为服务就绪——服务在应答只是要认证;
+        /// 只有连接失败（超时/拒绝, 无任何响应）才算不健康。
+        /// 2026-09-03 修复: alpha.5 加 token 认证后 401 被误判为失败, 导致启动器反复"清理重启"。
+        /// </summary>
+        public static bool HttpMarkerOk()
+        {
+            return HttpProbeStatus() >= 0;
+        }
+
+        /// <summary>探测 HTTP 状态码: 返回 >=0 = 拿到 HTTP 响应（200/401/403…）; -1 = 连不上(无响应)。</summary>
+        public static int HttpProbeStatus()
+        {
+            HttpWebRequest req = null;
+            try
+            {
+                req = (HttpWebRequest)WebRequest.Create(LauncherConfig.Url);
+                req.Timeout = 5000;
+                req.ReadWriteTimeout = 5000;
+                req.UserAgent = "DSHLauncher/1.1";
+                req.AllowAutoRedirect = false;
+                using (HttpWebResponse resp = (HttpWebResponse)req.GetResponse())
+                {
+                    return (int)resp.StatusCode;
+                }
+            }
+            catch (WebException wex)
+            {
+                // 4xx/5xx 在 HttpWebRequest 里以 WebException 抛出, 但 Response 非空 = 服务在应答
+                HttpWebResponse eresp = wex.Response as HttpWebResponse;
+                if (eresp != null)
+                {
+                    try { return (int)eresp.StatusCode; }
+                    catch { return -1; }
+                }
+                return -1;   // 无响应 = 连不上
+            }
+            catch { return -1; }
+            finally
+            {
+                if (req != null) { try { req.Abort(); } catch { } }
+            }
+        }
+
+        // 快检: 仅看端口监听, 供 3 秒一次的托盘监视器用 (避免频繁下载整页 HTML)
+        public static bool IsDshListening()
+        {
+            return TcpListening(LauncherConfig.Port);
+        }
+
+        // 全检: 端口 + HTTP 特征标记, 供用户动作与启动轮询用
+        public static bool IsDshHealthy()
+        {
+            if (!TcpListening(LauncherConfig.Port)) return false;
+            return HttpMarkerOk();
+        }
+
+        public static int PortFromCmdLine(string cmd)
+        {
+            Match m = Regex.Match(cmd, @"--port[=\s]+(\d+)", RegexOptions.IgnoreCase);
+            if (m.Success)
+            {
+                int p;
+                if (int.TryParse(m.Groups[1].Value, out p)) return p;
+            }
+            return LauncherConfig.DefaultPort;
+        }
+
+        // ---------------- 进程治理 ----------------
+
+        // WMI: 找出命令行匹配 dsh 且端口一致的所有 node 进程 ("清理旧的一切进程"的核心)
+        public static List<int> FindDshNodePids()
+        {
+            List<int> pids = new List<int>();
+            try
+            {
+                using (ManagementObjectSearcher searcher = new ManagementObjectSearcher(
+                    "SELECT ProcessId, CommandLine FROM Win32_Process WHERE Name = 'node.exe'"))
+                {
+                    foreach (ManagementBaseObject o in searcher.Get())
+                    {
+                        try
+                        {
+                            object cl = o["CommandLine"];
+                            if (cl == null) continue;
+                            string cmd = cl.ToString();
+                            if (cmd.IndexOf("deepseek-ai\\dsh", StringComparison.OrdinalIgnoreCase) < 0) continue;
+                            if (PortFromCmdLine(cmd) == LauncherConfig.Port) pids.Add(Convert.ToInt32(o["ProcessId"]));
+                        }
+                        catch { }
+                    }
+                }
+            }
+            catch (Exception ex) { LauncherLog.Write("WMI 枚举失败: " + ex.Message); }
+            return pids;
+        }
+
+        // netstat: 找出监听目标端口的 PID (兜底, 防漏网)
+        public static List<int> FindPortPids()
+        {
+            List<int> pids = new List<int>();
+            try
+            {
+                ProcessStartInfo psi = new ProcessStartInfo("netstat.exe", "-ano");
+                psi.UseShellExecute = false;
+                psi.RedirectStandardOutput = true;
+                psi.CreateNoWindow = true;
+                using (Process p = Process.Start(psi))
+                {
+                    string output = p.StandardOutput.ReadToEnd();
+                    p.WaitForExit();
+                    string needle = ":" + LauncherConfig.Port + " ";
+                    foreach (string line in output.Split('\n'))
+                    {
+                        if (line.IndexOf(needle, StringComparison.Ordinal) < 0) continue;
+                        if (line.IndexOf("LISTENING", StringComparison.OrdinalIgnoreCase) < 0) continue;
+                        string[] parts = line.Split(new char[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
+                        if (parts.Length >= 5)
+                        {
+                            int pid;
+                            if (int.TryParse(parts[4], out pid)) pids.Add(pid);
+                        }
+                    }
+                }
+            }
+            catch (Exception ex) { LauncherLog.Write("netstat 枚举失败: " + ex.Message); }
+            return pids;
+        }
+
+        private static bool IsAlive(int pid)
+        {
+            try { using (Process p = Process.GetProcessById(pid)) { return true; } }
+            catch { return false; }
+        }
+
+        private static void KillPid(int pid, string why)
+        {
+            if (!IsAlive(pid))
+            {
+                LauncherLog.Write("  PID " + pid + " 已不存在 (跳过: " + why + ")");
+                return;
+            }
+            try
+            {
+                using (Process p = Process.GetProcessById(pid))
+                    LauncherLog.Write("  清理: PID " + pid + " (" + p.ProcessName + ") - " + why);
+            }
+            catch { }
+            try
+            {
+                ProcessStartInfo psi = new ProcessStartInfo("taskkill.exe", "/PID " + pid + " /T /F");
+                psi.UseShellExecute = false;
+                psi.CreateNoWindow = true;
+                psi.RedirectStandardOutput = true;
+                psi.RedirectStandardError = true;
+                using (Process k = Process.Start(psi))
+                {
+                    string o = k.StandardOutput.ReadToEnd();
+                    string e = k.StandardError.ReadToEnd();
+                    k.WaitForExit(15000);
+                    LauncherLog.Write("  taskkill " + pid + ": " + (o + e).Trim());
+                }
+            }
+            catch (Exception ex)
+            {
+                LauncherLog.Write("  taskkill " + pid + " 异常: " + ex.Message);
+                try { using (Process p = Process.GetProcessById(pid)) p.Kill(); } catch { }
+            }
+        }
+
+        public static void SweepKill()
+        {
+            HashSet<int> killed = new HashSet<int>();
+            if (File.Exists(LauncherConfig.PidFile))
+            {
+                try
+                {
+                    string s = File.ReadAllText(LauncherConfig.PidFile).Trim();
+                    int pid;
+                    if (int.TryParse(s, out pid))
+                    {
+                        LauncherLog.Write("  pid 文件: " + LauncherConfig.PidFile + " -> " + pid);
+                        KillPid(pid, "pid 文件记录");
+                        killed.Add(pid);
+                    }
+                }
+                catch { }
+            }
+            List<int> wmi = FindDshNodePids();
+            foreach (int pid in wmi)
+            {
+                if (!killed.Contains(pid)) { KillPid(pid, "命令行匹配 dsh (端口 " + LauncherConfig.Port + ")"); killed.Add(pid); }
+            }
+            List<int> port = FindPortPids();
+            foreach (int pid in port)
+            {
+                if (!killed.Contains(pid)) { KillPid(pid, "监听端口 " + LauncherConfig.Port); killed.Add(pid); }
+            }
+            if (killed.Count == 0) LauncherLog.Write("  未发现需要清理的 DSH 进程");
+        }
+
+        private static bool WaitPortRelease(int tries, int delayMs)
+        {
+            for (int i = 0; i < tries; i++)
+            {
+                if (!TcpListening(LauncherConfig.Port)) return true;
+                Thread.Sleep(delayMs);
+            }
+            return !TcpListening(LauncherConfig.Port);
+        }
+
+        // ---------------- 启停 ----------------
+
+        public static bool StopDsh()
+        {
+            LauncherLog.Write("== 停止 DSH (端口 " + LauncherConfig.Port + ") ==");
+            SweepKill();
+            bool clean = WaitPortRelease(20, 500);
+            if (!clean)
+            {
+                LauncherLog.Write("  端口仍被占用, 追加一轮清理");
+                SweepKill();
+                clean = WaitPortRelease(20, 500);
+            }
+            try { if (File.Exists(LauncherConfig.PidFile)) File.Delete(LauncherConfig.PidFile); } catch { }
+            LauncherLog.Write("== 停止完成, 端口已释放: " + clean + " ==");
+            return clean;
+        }
+
+        private static void RotateServiceLog(string path)
+        {
+            try
+            {
+                if (File.Exists(path))
+                {
+                    string prev = path + ".prev";
+                    if (File.Exists(prev)) File.Delete(prev);
+                    File.Move(path, prev);
+                }
+            }
+            catch { }
+        }
+
+        /// <summary>启动 DSH 进程并轮询就绪。返回 true=成功。原 StartDsh 语义：返回前进程引用归调用方管理。</summary>
+        public static Process StartDsh()
+        {
+            LauncherLog.Write("== 启动 DSH (端口 " + LauncherConfig.Port + ") ==");
+            try { Directory.CreateDirectory(LauncherConfig.LogDir); } catch { }
+            if (!File.Exists(LauncherConfig.NodeExe)) { LauncherLog.Write("错误: node.exe 不存在: " + LauncherConfig.NodeExe); return null; }
+            if (!File.Exists(LauncherConfig.DshBin)) { LauncherLog.Write("错误: 未找到 DSH 入口: " + LauncherConfig.DshBin); return null; }
+            RotateServiceLog(LauncherConfig.StdoutLog);
+            RotateServiceLog(LauncherConfig.StderrLog);
+
+            ProcessStartInfo psi = new ProcessStartInfo();
+            psi.FileName = LauncherConfig.NodeExe;
+            psi.Arguments = "\"" + LauncherConfig.DshBin + "\" web --port " + LauncherConfig.Port;
+            psi.WorkingDirectory = LauncherConfig.DshHome;
+            psi.UseShellExecute = false;
+            psi.CreateNoWindow = true;
+            psi.RedirectStandardOutput = true;
+            psi.RedirectStandardError = true;
+            psi.EnvironmentVariables["DSH_HOME"] = LauncherConfig.DshHome;
+
+            Process proc = new Process();
+            proc.StartInfo = psi;
+            proc.OutputDataReceived += delegate(object s, DataReceivedEventArgs e)
+            {
+                if (e.Data != null) LauncherLog.AppendServiceLog(LauncherConfig.StdoutLog, e.Data);
+            };
+            proc.ErrorDataReceived += delegate(object s, DataReceivedEventArgs e)
+            {
+                if (e.Data != null) LauncherLog.AppendServiceLog(LauncherConfig.StderrLog, e.Data);
+            };
+            try { proc.Start(); }
+            catch (Exception ex) { LauncherLog.Write("启动进程失败: " + ex.Message); return null; }
+            proc.BeginOutputReadLine();
+            proc.BeginErrorReadLine();
+            int pid = proc.Id;
+            LauncherLog.Write("  已启动: PID " + pid + "  " + psi.FileName + " " + psi.Arguments);
+            try { File.WriteAllText(LauncherConfig.PidFile, pid.ToString(), Encoding.ASCII); } catch { }
+
+            DateTime deadline = DateTime.Now.AddSeconds(120);
+            bool ready = false;
+            while (DateTime.Now < deadline)
+            {
+                Thread.Sleep(1000);
+                if (proc.HasExited)
+                {
+                    int code = -1;
+                    try { code = proc.ExitCode; } catch { }
+                    LauncherLog.Write("  进程提前退出, 退出码: " + code);
+                    break;
+                }
+                if (TcpListening(LauncherConfig.Port) && HttpMarkerOk()) { ready = true; break; }
+            }
+            if (ready)
+            {
+                LauncherLog.Write("== 启动成功: " + LauncherConfig.Url + " (PID " + pid + ") ==");
+                return proc;
+            }
+            LauncherLog.Write("== 启动失败 ==");
+            try { if (proc.HasExited && File.Exists(LauncherConfig.PidFile)) File.Delete(LauncherConfig.PidFile); } catch { }
+            LauncherLog.Write("--- stderr 尾部 ---");
+            string tail = LauncherLog.ReadTail(LauncherConfig.StderrLog, 20);
+            foreach (string line in tail.Split('\n'))
+                if (line.Trim().Length > 0) LauncherLog.Write("  | " + line.Trim());
+            try { if (!proc.HasExited) proc.Kill(); } catch { }
+            try { proc.Dispose(); } catch { }
+            return null;
+        }
+
+        // ---------------- 打开界面 ----------------
+
+        public static void OpenUi()
+        {
+            string chromeProxy = LauncherConfig.ChromeProxyPath;
+            if (chromeProxy != null && Directory.Exists(LauncherConfig.PwaDataDir))
+            {
+                try
+                {
+                    ProcessStartInfo psi = new ProcessStartInfo();
+                    psi.FileName = chromeProxy;
+                    psi.Arguments = "--profile-directory=Default --app-id=" + LauncherConfig.PwaAppId;
+                    psi.UseShellExecute = false;
+                    Process p = Process.Start(psi);
+                    if (p != null) { LauncherLog.Write("已打开 DSH 窗口 (Chrome PWA)"); return; }
+                }
+                catch (Exception ex) { LauncherLog.Write("PWA 启动失败, 改用浏览器: " + ex.Message); }
+            }
+            try
+            {
+                Process.Start(LauncherConfig.Url);
+                LauncherLog.Write("已打开浏览器: " + LauncherConfig.Url);
+            }
+            catch (Exception ex) { LauncherLog.Write("打开浏览器失败: " + ex.Message); }
+        }
+
+        // ---------------- 开机自启 ----------------
+
+        public static string StartupLnkPath
+        {
+            get { return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Startup), "DSH Launcher.lnk"); }
+        }
+
+        public static bool AutoStartEnabled()
+        {
+            return File.Exists(StartupLnkPath);
+        }
+
+        public static void ToggleAutoStart()
+        {
+            if (AutoStartEnabled())
+            {
+                try { File.Delete(StartupLnkPath); LauncherLog.Write("已关闭开机自启"); }
+                catch (Exception ex) { LauncherLog.Write("关闭开机自启失败: " + ex.Message); }
+                return;
+            }
+            try
+            {
+                Type wsType = Type.GetTypeFromProgID("WScript.Shell");
+                object shell = Activator.CreateInstance(wsType);
+                object lnk = wsType.InvokeMember("CreateShortcut",
+                    System.Reflection.BindingFlags.InvokeMethod, null, shell, new object[] { StartupLnkPath });
+                Type lt = lnk.GetType();
+                lt.InvokeMember("TargetPath", System.Reflection.BindingFlags.SetProperty, null, lnk,
+                    new object[] { LauncherConfig.ExeDir + "\\DshLauncher.exe" });
+                lt.InvokeMember("Arguments", System.Reflection.BindingFlags.SetProperty, null, lnk, new object[] { "" });
+                lt.InvokeMember("WorkingDirectory", System.Reflection.BindingFlags.SetProperty, null, lnk, new object[] { LauncherConfig.DataDir });
+                lt.InvokeMember("WindowStyle", System.Reflection.BindingFlags.SetProperty, null, lnk, new object[] { 7 });
+                lt.InvokeMember("Save", System.Reflection.BindingFlags.InvokeMethod, null, lnk, null);
+                LauncherLog.Write("已开启开机自启: " + StartupLnkPath);
+            }
+            catch (Exception ex)
+            {
+                LauncherLog.Write("开启开机自启失败: " + ex.Message);
+                MessageBox.Show("无法创建开机自启快捷方式: " + ex.Message, "DSH Launcher",
+                    MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+
+        // ---------------- 一次性模式 ----------------
+
+        public static void OneShotBoot(bool noOpen)
+        {
+            LauncherLog.Write("命令行启动: 清理并启动 (端口 " + LauncherConfig.Port + ")");
+            StopDsh();
+            Process proc = StartDsh();
+            if (proc != null)
+            {
+                Program.TrackServiceProcess(proc);
+                if (!noOpen) OpenUi();
+            }
+            else
+            {
+                string tail = LauncherLog.ReadTail(LauncherConfig.StderrLog, 10);
+                MessageBox.Show("DSH 启动失败。\n\n--- stderr 末尾 ---\n" + tail + "\n\n完整日志: " + LauncherConfig.LauncherLog,
+                    "DSH Launcher", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+
+        public static void OneShotStop()
+        {
+            bool had = TcpListening(LauncherConfig.Port);
+            StopDsh();
+            MessageBox.Show(had
+                ? "DSH 已停止。\n日志: " + LauncherConfig.LauncherLog
+                : "未发现运行中的 DSH 进程。\n日志: " + LauncherConfig.LauncherLog,
+                "DSH Launcher", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+
+        // ---------------- 诊断报告 ----------------
+
+        public static string BuildStatusReport()
+        {
+            StringBuilder sb = new StringBuilder();
+            sb.AppendLine("DSH Launcher 状态检查   时间: " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"));
+            sb.AppendLine("版本: 1.1.0");
+            sb.AppendLine("执行目录: " + LauncherConfig.ExeDir);
+            sb.AppendLine("数据目录: " + LauncherConfig.DataDir);
+            sb.AppendLine("端口: " + LauncherConfig.Port + "   URL: " + LauncherConfig.Url);
+            sb.AppendLine("配置文件: " + LauncherConfig.ConfigFile + "   存在=" + File.Exists(LauncherConfig.ConfigFile));
+            sb.AppendLine("node.exe: " + LauncherConfig.NodeExe + "   存在=" + File.Exists(LauncherConfig.NodeExe));
+            sb.AppendLine("DSH_HOME: " + LauncherConfig.DshHome);
+            sb.AppendLine("dsh bin.js: " + LauncherConfig.DshBin + "   存在=" + File.Exists(LauncherConfig.DshBin));
+            sb.AppendLine("web profile: " + Path.Combine(LauncherConfig.DshHome, "profiles", "web") + "   存在=" + Directory.Exists(Path.Combine(LauncherConfig.DshHome, "profiles", "web")));
+            sb.AppendLine("TCP 监听 " + LauncherConfig.Port + ": " + TcpListening(LauncherConfig.Port));
+            sb.AppendLine("HTTP 可达检查: " + HttpMarkerOk() + " (状态码 " + HttpProbeStatus() + ")");
+            sb.AppendLine("健康状态: " + (IsDshHealthy() ? "正常" : "异常 / 未运行"));
+            string pidText = "";
+            try
+            {
+                if (File.Exists(LauncherConfig.PidFile)) pidText = File.ReadAllText(LauncherConfig.PidFile).Trim();
+            }
+            catch { }
+            sb.AppendLine("pid 文件: " + LauncherConfig.PidFile + "   存在=" + File.Exists(LauncherConfig.PidFile) + (pidText.Length > 0 ? "   内容=" + pidText : ""));
+            sb.AppendLine("Chrome PWA 界面可用: " + (LauncherConfig.ChromeProxyPath != null && Directory.Exists(LauncherConfig.PwaDataDir)));
+            List<int> wmi = FindDshNodePids();
+            sb.AppendLine("WMI 匹配 dsh 进程 (" + wmi.Count + "): " + string.Join(", ", wmi));
+            List<int> portPids = FindPortPids();
+            sb.AppendLine("端口 " + LauncherConfig.Port + " 监听 PID (" + portPids.Count + "): " + string.Join(", ", portPids));
+            return sb.ToString();
+        }
+
+        public static void WriteStatusFile()
+        {
+            try { Directory.CreateDirectory(LauncherConfig.LogDir); } catch { }
+            string report = BuildStatusReport();
+            try { File.WriteAllText(LauncherConfig.StatusFile, report, new UTF8Encoding(false)); } catch { }
+            LauncherLog.TryConsole(report);
+        }
+
+        public static void WriteSelfTestFile()
+        {
+            try { Directory.CreateDirectory(LauncherConfig.LogDir); } catch { }
+            StringBuilder sb = new StringBuilder();
+            sb.AppendLine("==== DSH Launcher 自检 ====   " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"));
+            sb.AppendLine(BuildStatusReport());
+            try
+            {
+                ProcessStartInfo psi = new ProcessStartInfo(LauncherConfig.NodeExe, "--version");
+                psi.UseShellExecute = false;
+                psi.RedirectStandardOutput = true;
+                psi.CreateNoWindow = true;
+                using (Process p = Process.Start(psi))
+                {
+                    string v = p.StandardOutput.ReadToEnd().Trim();
+                    p.WaitForExit();
+                    sb.AppendLine("node --version: " + v);
+                }
+            }
+            catch (Exception ex) { sb.AppendLine("node --version 失败: " + ex.Message); }
+            try
+            {
+                using (ManagementObjectSearcher s = new ManagementObjectSearcher("SELECT ProcessId FROM Win32_Process"))
+                {
+                    s.Get();
+                    sb.AppendLine("WMI 可用: 是");
+                }
+            }
+            catch (Exception ex) { sb.AppendLine("WMI 可用: 否 - " + ex.Message); }
+            try
+            {
+                ProcessStartInfo psi = new ProcessStartInfo("netstat.exe", "-ano");
+                psi.UseShellExecute = false;
+                psi.RedirectStandardOutput = true;
+                psi.CreateNoWindow = true;
+                using (Process p = Process.Start(psi))
+                {
+                    string o = p.StandardOutput.ReadToEnd();
+                    p.WaitForExit();
+                    sb.AppendLine("netstat 可用: 是 (输出 " + o.Length + " 字符)");
+                }
+            }
+            catch (Exception ex) { sb.AppendLine("netstat 可用: 否 - " + ex.Message); }
+            sb.AppendLine("==== 自检结束 ====");
+            string report = sb.ToString();
+            try { File.WriteAllText(LauncherConfig.SelfTestFile, report, new UTF8Encoding(false)); } catch { }
+            LauncherLog.TryConsole(report);
+        }
+
+        public static void WriteHelp()
+        {
+            string help =
+"DSH Launcher - DeepSeek Harness 系统托盘启动器 (v1.1.0)\n" +
+"\n" +
+"用法: DshLauncher.exe [选项]\n" +
+"  (无参数)               启动托盘; DSH 未运行则自动清理并启动\n" +
+"  --open                 启动托盘并打开 DSH 界面 (健康直接开, 异常清理重启)\n" +
+"  --start [--noopen]     一次性: 清理旧进程 -> 启动 -> 打开界面\n" +
+"  --restart [--noopen]   一次性: 同 --start\n" +
+"  --stop                 一次性: 停止 DSH (弹窗确认)\n" +
+"  --status               状态报告 -> logs\\status.txt\n" +
+"  --selftest             环境自检 -> logs\\selftest.txt\n" +
+"  --port N               覆盖端口 (默认 3080)\n" +
+"  --help                 本帮助\n" +
+"\n" +
+"配置文件: " + LauncherConfig.ConfigFile + "\n" +
+"  port=3080       端口\n" +
+"  dsh_home=...    DSH 安装目录 (默认 $DSH_HOME 或 ~/.dsh)\n" +
+"\n" +
+"数据/日志目录: " + LauncherConfig.DataDir + "\n" +
+"托盘菜单: 打开界面 / 重启(清理旧进程) / 停止 / 查看日志 / 开机自启 / 退出\n";
+            LauncherLog.Write(help);
+            LauncherLog.TryConsole(help);
+        }
+    }
+}
