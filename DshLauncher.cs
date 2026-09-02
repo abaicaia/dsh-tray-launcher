@@ -139,10 +139,13 @@ namespace DshLauncher
             {
                 try
                 {
-                    using (NamedPipeServerStream server = new NamedPipeServerStream(name, PipeDirection.In, 1))
+                    // InOut: 收到命令后回写 ACK, 让 SendCommand 能确认"命令真的被接收"
+                    // (修 2026-09-03: 旧版只读, 连上僵尸句柄也算成功, fallback 无法触发)
+                    using (NamedPipeServerStream server = new NamedPipeServerStream(name, PipeDirection.InOut, 1))
                     {
                         server.WaitForConnection();
                         using (StreamReader reader = new StreamReader(server, Encoding.UTF8))
+                        using (StreamWriter writer = new StreamWriter(server, Encoding.UTF8))
                         {
                             string cmd = reader.ReadLine();
                             if (!string.IsNullOrEmpty(cmd))
@@ -150,6 +153,12 @@ namespace DshLauncher
                                 LauncherLog.Write("收到命令: " + cmd);
                                 lock (QueueLock) _commandQueue.Add(cmd);
                             }
+                            try
+                            {
+                                writer.WriteLine("ACK");
+                                writer.Flush();
+                            }
+                            catch { }
                         }
                     }
                 }
@@ -168,20 +177,46 @@ namespace DshLauncher
             {
                 try
                 {
-                    using (NamedPipeClientStream client = new NamedPipeClientStream(".", name, PipeDirection.Out))
+                    // InOut + 等 ACK: 只有对方确认收到才算成功
+                    // (修 2026-09-03: 旧版只写不等回执, 连上僵尸管道句柄也返回 true,
+                    //  命令被丢弃且 fallback 分支永远进不去)
+                    using (NamedPipeClientStream client = new NamedPipeClientStream(".", name, PipeDirection.InOut))
                     {
                         client.Connect(3000);
                         using (StreamWriter writer = new StreamWriter(client, Encoding.UTF8))
+                        using (StreamReader reader = new StreamReader(client, Encoding.UTF8))
                         {
                             writer.WriteLine(cmd);
                             writer.Flush();
+                            // 读 ACK, 带超时保护(ReadToEnd 会阻塞到对端关连接, 用 Read 逐字节+超时)
+                            string ack = ReadLineWithTimeout(reader, 3000);
+                            if (ack == "ACK") return true;
+                            LauncherLog.Write("SendCommand 未收到 ACK (cmd=" + cmd + ", 收到: " + (ack ?? "null") + ")");
                         }
                     }
-                    return true;
                 }
                 catch { Thread.Sleep(500); }
             }
             return false;
+        }
+
+        /// <summary>从管道读一行, 带毫秒超时; 超时返回 null。避免 ReadLine 无限阻塞。</summary>
+        private static string ReadLineWithTimeout(StreamReader reader, int timeoutMs)
+        {
+            try
+            {
+                reader.BaseStream.ReadTimeout = timeoutMs;
+                StringBuilder sb = new StringBuilder();
+                while (true)
+                {
+                    int ch = reader.Read();   // ReadTimeout 触发时抛 IOException
+                    if (ch < 0) return sb.Length > 0 ? sb.ToString() : null;   // 流结束
+                    if (ch == '\n') return sb.ToString().TrimEnd('\r');
+                    sb.Append((char)ch);
+                }
+            }
+            catch (IOException) { return null; }   // 读超时
+            catch { return null; }
         }
 
         // ---------------- 托盘主循环 ----------------

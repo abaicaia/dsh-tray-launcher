@@ -431,8 +431,11 @@ namespace DshLauncher
             else
             {
                 string tail = LauncherLog.ReadTail(LauncherConfig.StderrLog, 10);
-                MessageBox.Show("DSH 启动失败。\n\n--- stderr 末尾 ---\n" + tail + "\n\n完整日志: " + LauncherConfig.LauncherLog,
-                    "DSH Launcher", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                // 一次性模式是命令行/脚本工具: 不弹 GUI 窗(会阻塞无人值守), 走日志+控制台
+                // (修 2026-09-03: 旧版 MessageBox.Show 在脚本/定时任务场景卡死进程)
+                string msg = "DSH 启动失败。\n\n--- stderr 末尾 ---\n" + tail + "\n\n完整日志: " + LauncherConfig.LauncherLog;
+                LauncherLog.Write(msg);
+                LauncherLog.TryConsole(msg);
             }
         }
 
@@ -440,10 +443,12 @@ namespace DshLauncher
         {
             bool had = TcpListening(LauncherConfig.Port);
             StopDsh();
-            MessageBox.Show(had
+            // 一次性模式不弹窗(见 OneShotBoot 注释), 结果走日志+控制台
+            string msg = had
                 ? "DSH 已停止。\n日志: " + LauncherConfig.LauncherLog
-                : "未发现运行中的 DSH 进程。\n日志: " + LauncherConfig.LauncherLog,
-                "DSH Launcher", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                : "未发现运行中的 DSH 进程。\n日志: " + LauncherConfig.LauncherLog;
+            LauncherLog.Write(msg.Replace("\n", " "));
+            LauncherLog.TryConsole(msg);
         }
 
         // ---------------- 诊断报告 ----------------
