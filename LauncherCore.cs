@@ -279,10 +279,13 @@ namespace DshLauncher
             catch { }
         }
 
-        /// <summary>启动 DSH 进程并轮询就绪。返回 true=成功。原 StartDsh 语义：返回前进程引用归调用方管理。</summary>
-        public static Process StartDsh()
+        /// <summary>启动 DSH 进程并轮询就绪。返回 true=成功。原 StartDsh 语义：返回前进程引用归调用方管理。
+        /// detached=true 时 DSH 的 stdout/stderr 直接重定向到日志文件（不经过启动器管道），
+        /// 让 DSH 在启动器（一次性命令）退出后仍能独立存活，避免管道读端关闭导致 EPIPE 崩溃。
+        /// 托盘模式（常驻）传 false，保持原管道实时日志行为。</summary>
+        public static Process StartDsh(bool detached = false)
         {
-            LauncherLog.Write("== 启动 DSH (端口 " + LauncherConfig.Port + ") ==");
+            LauncherLog.Write("== 启动 DSH (端口 " + LauncherConfig.Port + ")" + (detached ? " [detached]" : "") + " ==");
             try { Directory.CreateDirectory(LauncherConfig.LogDir); } catch { }
             if (!File.Exists(LauncherConfig.NodeExe)) { LauncherLog.Write("错误: node.exe 不存在: " + LauncherConfig.NodeExe); return null; }
             if (!File.Exists(LauncherConfig.DshBin)) { LauncherLog.Write("错误: 未找到 DSH 入口: " + LauncherConfig.DshBin); return null; }
@@ -295,24 +298,44 @@ namespace DshLauncher
             psi.WorkingDirectory = LauncherConfig.DshHome;
             psi.UseShellExecute = false;
             psi.CreateNoWindow = true;
-            psi.RedirectStandardOutput = true;
-            psi.RedirectStandardError = true;
             psi.EnvironmentVariables["DSH_HOME"] = LauncherConfig.DshHome;
 
             Process proc = new Process();
             proc.StartInfo = psi;
-            proc.OutputDataReceived += delegate(object s, DataReceivedEventArgs e)
+
+            if (detached)
             {
-                if (e.Data != null) LauncherLog.AppendServiceLog(LauncherConfig.StdoutLog, e.Data);
-            };
-            proc.ErrorDataReceived += delegate(object s, DataReceivedEventArgs e)
+                // 一次性模式(--start/--restart)：用 cmd 包装 + 文件重定向。
+                // DSH 的 stdout/stderr 由 cmd 重定向到日志文件（文件句柄独立于启动器生命周期），
+                // 启动器退出后 DSH 继续存活并持续写日志，不再依赖启动器管道读端。
+                // 注意：proc.Id 此时是 cmd.exe 的 PID；StopDsh 用 taskkill /T 会连带杀掉 node。
+                psi.FileName = "cmd.exe";
+                psi.Arguments = "/c \"\"" + LauncherConfig.NodeExe + "\" \"" + LauncherConfig.DshBin
+                    + "\" web --port " + LauncherConfig.Port
+                    + " > \"" + LauncherConfig.StdoutLog + "\" 2> \"" + LauncherConfig.StderrLog + "\"\"";
+                psi.RedirectStandardOutput = false;
+                psi.RedirectStandardError = false;
+                try { proc.Start(); }
+                catch (Exception ex) { LauncherLog.Write("启动进程失败: " + ex.Message); return null; }
+            }
+            else
             {
-                if (e.Data != null) LauncherLog.AppendServiceLog(LauncherConfig.StderrLog, e.Data);
-            };
-            try { proc.Start(); }
-            catch (Exception ex) { LauncherLog.Write("启动进程失败: " + ex.Message); return null; }
-            proc.BeginOutputReadLine();
-            proc.BeginErrorReadLine();
+                // 托盘模式(常驻)：持有管道收实时日志（读端在托盘进程，随托盘存活）。
+                psi.RedirectStandardOutput = true;
+                psi.RedirectStandardError = true;
+                proc.OutputDataReceived += delegate(object s, DataReceivedEventArgs e)
+                {
+                    if (e.Data != null) LauncherLog.AppendServiceLog(LauncherConfig.StdoutLog, e.Data);
+                };
+                proc.ErrorDataReceived += delegate(object s, DataReceivedEventArgs e)
+                {
+                    if (e.Data != null) LauncherLog.AppendServiceLog(LauncherConfig.StderrLog, e.Data);
+                };
+                try { proc.Start(); }
+                catch (Exception ex) { LauncherLog.Write("启动进程失败: " + ex.Message); return null; }
+                proc.BeginOutputReadLine();
+                proc.BeginErrorReadLine();
+            }
             int pid = proc.Id;
             LauncherLog.Write("  已启动: PID " + pid + "  " + psi.FileName + " " + psi.Arguments);
             try { File.WriteAllText(LauncherConfig.PidFile, pid.ToString(), Encoding.ASCII); } catch { }
@@ -422,7 +445,7 @@ namespace DshLauncher
         {
             LauncherLog.Write("命令行启动: 清理并启动 (端口 " + LauncherConfig.Port + ")");
             StopDsh();
-            Process proc = StartDsh();
+            Process proc = StartDsh(true);   // detached：一次性命令启动，stdout/stderr 走文件，DSH 不依赖启动器生命周期
             if (proc != null)
             {
                 Program.TrackServiceProcess(proc);
