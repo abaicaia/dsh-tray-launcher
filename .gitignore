@@ -14,3 +14,8 @@ obj/
 github-repo/
 package-src/
 release/
+
+# 运行/备份产物（2026-09-28）
+DshLauncher.exe.bak-*
+DshLauncher.old-running.exe
+DshLauncher.new.exe

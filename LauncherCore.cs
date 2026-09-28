@@ -142,6 +142,7 @@ namespace DshLauncher
                 ProcessStartInfo psi = new ProcessStartInfo("netstat.exe", "-ano");
                 psi.UseShellExecute = false;
                 psi.RedirectStandardOutput = true;
+                psi.StandardOutputEncoding = Encoding.UTF8;
                 psi.CreateNoWindow = true;
                 using (Process p = Process.Start(psi))
                 {
@@ -191,6 +192,8 @@ namespace DshLauncher
                 psi.CreateNoWindow = true;
                 psi.RedirectStandardOutput = true;
                 psi.RedirectStandardError = true;
+                psi.StandardOutputEncoding = Encoding.UTF8;
+                psi.StandardErrorEncoding = Encoding.UTF8;
                 using (Process k = Process.Start(psi))
                 {
                     string o = k.StandardOutput.ReadToEnd();
@@ -321,8 +324,12 @@ namespace DshLauncher
             else
             {
                 // 托盘模式(常驻)：持有管道收实时日志（读端在托盘进程，随托盘存活）。
+                // 必须显式声明 StandardOutputEncoding：node 写出的是 UTF-8，
+                // 不设置时 .NET 按进程控制台代码页（中文系统=GBK）解码 → 中文日志乱码。
                 psi.RedirectStandardOutput = true;
                 psi.RedirectStandardError = true;
+                psi.StandardOutputEncoding = Encoding.UTF8;
+                psi.StandardErrorEncoding = Encoding.UTF8;
                 proc.OutputDataReceived += delegate(object s, DataReceivedEventArgs e)
                 {
                     if (e.Data != null) LauncherLog.AppendServiceLog(LauncherConfig.StdoutLog, e.Data);
@@ -394,6 +401,44 @@ namespace DshLauncher
                 LauncherLog.Write("已打开浏览器: " + LauncherConfig.Url);
             }
             catch (Exception ex) { LauncherLog.Write("打开浏览器失败: " + ex.Message); }
+        }
+
+        // ---------------- 急救：叫小D来修 ----------------
+
+        /// <summary>
+        /// 界面打不开 / 被 "Failed to load plugins" 盖住时的后路：在**新控制台窗口**里跑
+        /// ask-xiaod.cmd（一次性 headless agent —— 独立 profile，不吃 web 的插件树，不依赖网页）。
+        /// 路径可用环境变量 DSH_ASK_CMD 覆盖（测试 / 迁移用）。
+        /// </summary>
+        public static void OpenAskXiaoD()
+        {
+            string cmd = Environment.GetEnvironmentVariable("DSH_ASK_CMD");
+            if (string.IsNullOrEmpty(cmd)) cmd = Path.Combine(LauncherConfig.ExeDir, "ask-xiaod.cmd");
+            if (!File.Exists(cmd))
+            {
+                LauncherLog.Write("叫小D失败: 找不到 " + cmd);
+                MessageBox.Show("找不到急救入口:\n" + cmd +
+                    "\n\n它应与启动器放在同一目录（ask-xiaod.cmd + ask-xiaod.ps1）。",
+                    "DSH Launcher", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+            try
+            {
+                ProcessStartInfo psi = new ProcessStartInfo();
+                psi.FileName = "cmd.exe";
+                psi.Arguments = "/c \"" + cmd + "\"";
+                psi.WorkingDirectory = LauncherConfig.ExeDir;
+                // 本程序是 winexe（没有自己的控制台）→ 必须 shell execute 才会弹出新的控制台窗口
+                psi.UseShellExecute = true;
+                Process.Start(psi);
+                LauncherLog.Write("已打开急救入口: " + cmd);
+            }
+            catch (Exception ex)
+            {
+                LauncherLog.Write("叫小D失败: " + ex.Message);
+                MessageBox.Show("打开急救入口失败: " + ex.Message, "DSH Launcher",
+                    MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
         }
 
         // ---------------- 开机自启 ----------------
@@ -526,6 +571,7 @@ namespace DshLauncher
                 ProcessStartInfo psi = new ProcessStartInfo(LauncherConfig.NodeExe, "--version");
                 psi.UseShellExecute = false;
                 psi.RedirectStandardOutput = true;
+                psi.StandardOutputEncoding = Encoding.UTF8;
                 psi.CreateNoWindow = true;
                 using (Process p = Process.Start(psi))
                 {
@@ -549,6 +595,7 @@ namespace DshLauncher
                 ProcessStartInfo psi = new ProcessStartInfo("netstat.exe", "-ano");
                 psi.UseShellExecute = false;
                 psi.RedirectStandardOutput = true;
+                psi.StandardOutputEncoding = Encoding.UTF8;
                 psi.CreateNoWindow = true;
                 using (Process p = Process.Start(psi))
                 {
@@ -574,6 +621,7 @@ namespace DshLauncher
 "  --open                 启动托盘并打开 DSH 界面 (健康直接开, 异常清理重启)\n" +
 "  --start [--noopen]     一次性: 清理旧进程 -> 启动 -> 打开界面\n" +
 "  --restart [--noopen]   一次性: 同 --start\n" +
+"  --ask                  叫小D来修: 新控制台窗口里跑 ask-xiaod.cmd (界面打不开时用)\n" +
 "  --stop                 一次性: 停止 DSH (弹窗确认)\n" +
 "  --status               状态报告 -> logs\\status.txt\n" +
 "  --selftest             环境自检 -> logs\\selftest.txt\n" +

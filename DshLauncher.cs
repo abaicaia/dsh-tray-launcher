@@ -234,6 +234,7 @@ namespace DshLauncher
             ContextMenuStrip menu = new ContextMenuStrip();
             menu.Items.Add("打开 DSH 界面", null, delegate { EnsureRunningAndOpenUi(); });
             menu.Items.Add("重启 DSH（清理旧进程）", null, delegate { RestartDsh(); });
+            menu.Items.Add("叫小D来修（界面打不开时）", null, delegate { LauncherCore.OpenAskXiaoD(); });
             menu.Items.Add("停止 DSH", null, delegate { StopDshTray(); });
             menu.Items.Add("查看日志", null, delegate { try { Process.Start(LauncherConfig.LogDir); } catch { } });
             menu.Items.Add(new ToolStripSeparator());
@@ -351,6 +352,7 @@ namespace DshLauncher
             t.Add("--stop", o => LauncherCore.OneShotStop());
             t.Add("--start", o => LauncherCore.OneShotBoot(o.NoOpen));
             t.Add("--restart", o => LauncherCore.OneShotBoot(o.NoOpen));
+            t.Add("--ask", o => LauncherCore.OpenAskXiaoD());
             return t;
         }
 
@@ -402,6 +404,8 @@ namespace DshLauncher
                     // 状态类命令本进程直跑; 动作类命令优先转发给托盘
                     if (opt.Mode == "--status") { LauncherCore.WriteStatusFile(); return; }
                     if (opt.Mode == "--selftest") { LauncherCore.WriteSelfTestFile(); return; }
+                    // 急救入口与托盘的管道无关：直接在本进程弹新控制台窗口，不必转发
+                    if (opt.Mode == "--ask") { LauncherCore.OpenAskXiaoD(); return; }
                     string cmd = "open";
                     if (opt.Mode == "--restart") cmd = "restart";
                     else if (opt.Mode == "--stop") cmd = "stop";
