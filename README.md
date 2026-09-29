@@ -48,10 +48,6 @@ DshLauncher.exe --port 3199            指定端口 (默认 3080)
 DshLauncher.exe --help                 帮助
 ```
 
-## 配置文件（可选）
-
-程序目录下 `dsh-launcher.conf`：`port=3080`（端口）、`dsh_home=...`（DSH 安装目录，默认 $DSH_HOME 或 ~/.dsh）。
-
 ## 出问题了怎么查
 
 1. 打开 `logs\launcher.log` —— 每次清理/启动都有时间戳记录，启动失败会附 stderr 尾部。

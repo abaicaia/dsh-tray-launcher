@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
@@ -134,8 +134,12 @@ namespace DshLauncher
         }
 
         // netstat: 找出监听目标端口的 PID (兜底, 防漏网)
-        public static List<int> FindPortPids()
+        // v1.2：加端口参数 —— 救援实例要查 3090，原先写死 LauncherConfig.Port 用不了。
+        public static List<int> FindPortPids() { return FindPortPids(0); }
+
+        public static List<int> FindPortPids(int port)
         {
+            if (port <= 0) port = LauncherConfig.Port;
             List<int> pids = new List<int>();
             try
             {
@@ -148,7 +152,7 @@ namespace DshLauncher
                 {
                     string output = p.StandardOutput.ReadToEnd();
                     p.WaitForExit();
-                    string needle = ":" + LauncherConfig.Port + " ";
+                    string needle = ":" + port + " ";
                     foreach (string line in output.Split('\n'))
                     {
                         if (line.IndexOf(needle, StringComparison.Ordinal) < 0) continue;
@@ -164,6 +168,14 @@ namespace DshLauncher
             }
             catch (Exception ex) { LauncherLog.Write("netstat 枚举失败: " + ex.Message); }
             return pids;
+        }
+
+        /// <summary>停掉监听某端口的进程（救援实例切换用）。只按端口找，不碰别的。</summary>
+        public static void KillPidsOnPort(int port, string why)
+        {
+            List<int> pids = FindPortPids(port);
+            if (pids.Count == 0) { LauncherLog.Write("  端口 " + port + " 上没有监听进程"); return; }
+            foreach (int pid in pids) KillPid(pid, why);
         }
 
         private static bool IsAlive(int pid)
@@ -286,22 +298,36 @@ namespace DshLauncher
         /// detached=true 时 DSH 的 stdout/stderr 直接重定向到日志文件（不经过启动器管道），
         /// 让 DSH 在启动器（一次性命令）退出后仍能独立存活，避免管道读端关闭导致 EPIPE 崩溃。
         /// 托盘模式（常驻）传 false，保持原管道实时日志行为。</summary>
-        public static Process StartDsh(bool detached = false)
+        public static Process StartDsh(bool detached = false) { return StartDsh(detached, 0, null, null); }
+
+        /// <summary>
+        /// 起一个 DSH 实例（v1.2 起支持救援实例，合并原先 RescueMode 里那套重复启动逻辑）。
+        /// port 传 0 → 用 LauncherConfig.Port；extraEnvName/Val 用于安全模式（DSH_SAFE_MODE=1）。
+        /// 救援实例（非主端口）**不写主 PID 文件**，也**不跑 HttpMarkerOk()**（它按主端口探活），
+        /// 日志与 pid 一律按端口分开，避免和主实例互相覆盖。
+        /// </summary>
+        public static Process StartDsh(bool detached, int port, string extraEnvName, string extraEnvVal)
         {
-            LauncherLog.Write("== 启动 DSH (端口 " + LauncherConfig.Port + ")" + (detached ? " [detached]" : "") + " ==");
+            if (port <= 0) port = LauncherConfig.Port;
+            bool isMainPort = (port == LauncherConfig.Port);
+            string pidFile = LauncherConfig.PidFileFor(port);
+            string outLog = LauncherConfig.StdoutLogFor(port);
+            string errLog = LauncherConfig.StderrLogFor(port);
+            LauncherLog.Write("== 启动 DSH (端口 " + port + ")" + (detached ? " [detached]" : "") + (isMainPort ? "" : " [救援实例]") + " ==");
             try { Directory.CreateDirectory(LauncherConfig.LogDir); } catch { }
             if (!File.Exists(LauncherConfig.NodeExe)) { LauncherLog.Write("错误: node.exe 不存在: " + LauncherConfig.NodeExe); return null; }
             if (!File.Exists(LauncherConfig.DshBin)) { LauncherLog.Write("错误: 未找到 DSH 入口: " + LauncherConfig.DshBin); return null; }
-            RotateServiceLog(LauncherConfig.StdoutLog);
-            RotateServiceLog(LauncherConfig.StderrLog);
+            RotateServiceLog(outLog);
+            RotateServiceLog(errLog);
 
             ProcessStartInfo psi = new ProcessStartInfo();
             psi.FileName = LauncherConfig.NodeExe;
-            psi.Arguments = "\"" + LauncherConfig.DshBin + "\" web --port " + LauncherConfig.Port;
+            psi.Arguments = "\"" + LauncherConfig.DshBin + "\" web --port " + port;
             psi.WorkingDirectory = LauncherConfig.DshHome;
             psi.UseShellExecute = false;
             psi.CreateNoWindow = true;
             psi.EnvironmentVariables["DSH_HOME"] = LauncherConfig.DshHome;
+            if (extraEnvName != null) psi.EnvironmentVariables[extraEnvName] = extraEnvVal;
 
             Process proc = new Process();
             proc.StartInfo = psi;
@@ -314,8 +340,8 @@ namespace DshLauncher
                 // 注意：proc.Id 此时是 cmd.exe 的 PID；StopDsh 用 taskkill /T 会连带杀掉 node。
                 psi.FileName = "cmd.exe";
                 psi.Arguments = "/c \"\"" + LauncherConfig.NodeExe + "\" \"" + LauncherConfig.DshBin
-                    + "\" web --port " + LauncherConfig.Port
-                    + " > \"" + LauncherConfig.StdoutLog + "\" 2> \"" + LauncherConfig.StderrLog + "\"\"";
+                    + "\" web --port " + port
+                    + " > \"" + outLog + "\" 2> \"" + errLog + "\"\"";
                 psi.RedirectStandardOutput = false;
                 psi.RedirectStandardError = false;
                 try { proc.Start(); }
@@ -332,11 +358,11 @@ namespace DshLauncher
                 psi.StandardErrorEncoding = Encoding.UTF8;
                 proc.OutputDataReceived += delegate(object s, DataReceivedEventArgs e)
                 {
-                    if (e.Data != null) LauncherLog.AppendServiceLog(LauncherConfig.StdoutLog, e.Data);
+                    if (e.Data != null) LauncherLog.AppendServiceLog(outLog, e.Data);
                 };
                 proc.ErrorDataReceived += delegate(object s, DataReceivedEventArgs e)
                 {
-                    if (e.Data != null) LauncherLog.AppendServiceLog(LauncherConfig.StderrLog, e.Data);
+                    if (e.Data != null) LauncherLog.AppendServiceLog(errLog, e.Data);
                 };
                 try { proc.Start(); }
                 catch (Exception ex) { LauncherLog.Write("启动进程失败: " + ex.Message); return null; }
@@ -345,7 +371,7 @@ namespace DshLauncher
             }
             int pid = proc.Id;
             LauncherLog.Write("  已启动: PID " + pid + "  " + psi.FileName + " " + psi.Arguments);
-            try { File.WriteAllText(LauncherConfig.PidFile, pid.ToString(), Encoding.ASCII); } catch { }
+            if (isMainPort) { try { File.WriteAllText(pidFile, pid.ToString(), Encoding.ASCII); } catch { } }
 
             DateTime deadline = DateTime.Now.AddSeconds(120);
             bool ready = false;
@@ -359,17 +385,17 @@ namespace DshLauncher
                     LauncherLog.Write("  进程提前退出, 退出码: " + code);
                     break;
                 }
-                if (TcpListening(LauncherConfig.Port) && HttpMarkerOk()) { ready = true; break; }
+                if (TcpListening(port) && (isMainPort ? HttpMarkerOk() : true)) { ready = true; break; }
             }
             if (ready)
             {
-                LauncherLog.Write("== 启动成功: " + LauncherConfig.Url + " (PID " + pid + ") ==");
+                LauncherLog.Write("== 启动成功: http://127.0.0.1:" + port + " (PID " + pid + ") ==");
                 return proc;
             }
             LauncherLog.Write("== 启动失败 ==");
-            try { if (proc.HasExited && File.Exists(LauncherConfig.PidFile)) File.Delete(LauncherConfig.PidFile); } catch { }
+            try { if (proc.HasExited && isMainPort && File.Exists(pidFile)) File.Delete(pidFile); } catch { }
             LauncherLog.Write("--- stderr 尾部 ---");
-            string tail = LauncherLog.ReadTail(LauncherConfig.StderrLog, 20);
+            string tail = LauncherLog.ReadTail(errLog, 20);
             foreach (string line in tail.Split('\n'))
                 if (line.Trim().Length > 0) LauncherLog.Write("  | " + line.Trim());
             try { if (!proc.HasExited) proc.Kill(); } catch { }
@@ -529,7 +555,6 @@ namespace DshLauncher
             sb.AppendLine("执行目录: " + LauncherConfig.ExeDir);
             sb.AppendLine("数据目录: " + LauncherConfig.DataDir);
             sb.AppendLine("端口: " + LauncherConfig.Port + "   URL: " + LauncherConfig.Url);
-            sb.AppendLine("配置文件: " + LauncherConfig.ConfigFile + "   存在=" + File.Exists(LauncherConfig.ConfigFile));
             sb.AppendLine("node.exe: " + LauncherConfig.NodeExe + "   存在=" + File.Exists(LauncherConfig.NodeExe));
             sb.AppendLine("DSH_HOME: " + LauncherConfig.DshHome);
             sb.AppendLine("dsh bin.js: " + LauncherConfig.DshBin + "   存在=" + File.Exists(LauncherConfig.DshBin));
@@ -628,12 +653,19 @@ namespace DshLauncher
 "  --port N               覆盖端口 (默认 3080)\n" +
 "  --help                 本帮助\n" +
 "\n" +
-"配置文件: " + LauncherConfig.ConfigFile + "\n" +
-"  port=3080       端口\n" +
-"  dsh_home=...    DSH 安装目录 (默认 $DSH_HOME 或 ~/.dsh)\n" +
+"-- 救援模式 (v1.2; 也可在托盘菜单「救援」里点) --\n" +
+"  --rescue-brief         收集现场: 只读生成诊断简报 (10 节)\n" +
+"  --rescue-diagnose      读最近简报并给修复建议\n" +
+"  --rescue-verify        救援验收: 8 项清单 (核心版本 / dump / patch / 补丁 / 农场 / 端口 / safe-mode)\n" +
+"  --rescue-scan          农场链接体检 (只读)\n" +
+"  --rescue-snapshots     列出可用配置快照\n" +
+"  --rescue-patches       本地补丁状态 (dry-run)\n" +
+"  --rescue-enter         进入安全模式: 停主实例 -> 在 3090 起干净实例 (跳过用户插件)\n" +
+"  --rescue-exit          退出安全模式: 停 3090 -> 清标记 -> 起回主实例\n" +
+"  (以上结果均落盘到 logs\\rescue-*.txt: 本程序是 winexe, 没有控制台输出)\n" +
 "\n" +
 "数据/日志目录: " + LauncherConfig.DataDir + "\n" +
-"托盘菜单: 打开界面 / 重启(清理旧进程) / 停止 / 查看日志 / 开机自启 / 退出\n";
+"托盘菜单: 打开界面 / 重启(清理旧进程) / 叫小D来修 / 救援(收集现场·验收·进/出安全模式) / 停止 / 查看日志 / 开机自启 / 退出\n";
             LauncherLog.Write(help);
             LauncherLog.TryConsole(help);
         }

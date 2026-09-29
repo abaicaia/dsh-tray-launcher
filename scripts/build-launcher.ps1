@@ -5,10 +5,28 @@ $ErrorActionPreference = 'Stop'
 $scriptDir = $PSScriptRoot
 if ([string]::IsNullOrEmpty($scriptDir)) { $scriptDir = (Get-Location).Path }
 
-$src  = Join-Path $scriptDir 'DshLauncher.cs'
-$asminfo = Join-Path $scriptDir 'AssemblyInfo.cs'
-$out  = Join-Path $scriptDir 'DshLauncher.exe'
-$ico  = Join-Path $scriptDir 'dsh-launcher.ico'
+# --- 0. 编码自检（硬约束，不靠记性）---
+# AGENTS.md §1：edit/write 写出的 .ps1/.cs 没有 BOM，被 GBK 解码就语法崩。
+# 2026-09-11 / 09-28 / 09-29 连踩三次，所以把检查放到编译路径上：不过直接停。
+$lintTool = [IO.Path]::GetFullPath((Join-Path (Split-Path $scriptDir -Parent) '..\tools\lint-encoding.mjs'))
+if (Test-Path $lintTool) {
+    & node $lintTool --root (Split-Path $scriptDir -Parent) --quiet
+    if ($LASTEXITCODE -ne 0) {
+        throw '编码自检没过。先跑：node "J:\2\gonzuo\tools\lint-encoding.mjs" --root "' + (Split-Path $scriptDir -Parent) + '" --fix'
+    }
+    Write-Host '[0/5] encoding lint: OK'
+}
+# v1.2 目录分类（src / assets / scripts），并兼容"发布包扁平放置"
+$rootDir = Split-Path $scriptDir -Parent
+# 自适应布局：开发目录是 scripts\ + src\ + assets\；发布包是扁平放置（全部同级）
+if (-not (Test-Path (Join-Path $rootDir 'src'))) { $rootDir = $scriptDir }
+$srcDir   = if (Test-Path (Join-Path $rootDir 'src'))    { Join-Path $rootDir 'src' }    else { $rootDir }
+$assetDir = if (Test-Path (Join-Path $rootDir 'assets')) { Join-Path $rootDir 'assets' } else { $rootDir }
+
+$src  = Join-Path $srcDir 'DshLauncher.cs'
+$asminfo = Join-Path $srcDir 'AssemblyInfo.cs'
+$out  = Join-Path $rootDir 'DshLauncher.exe'
+$ico  = Join-Path $assetDir 'dsh-launcher.ico'
 
 # --- 1. locate csc.exe (.NET Framework 4.x) ---
 $csc = 'C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe'
@@ -20,7 +38,7 @@ Write-Host "[1/5] csc: $csc"
 # preferred: blue circle badge with white DeepSeek whale (from DSH PWA logo);
 # fallback: plain blue circle with white D.
 Add-Type -AssemblyName System.Drawing
-$whaleSource = Join-Path $scriptDir 'pwa-logo.ico'
+$whaleSource = Join-Path $assetDir 'pwa-logo.ico'
 if (-not (Test-Path $whaleSource)) {
     $whaleSource = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'Google\Chrome\User Data\Default\Web Applications\_crx_hgiemfgfjhalibdoboikeiepnnjapnpc\DeepSeek Harness.ico'
 }
@@ -135,11 +153,12 @@ Write-Host "[2/5] icon: $ico ($((Get-Item $ico).Length) bytes)"
 # --- 3. sources must be UTF-8 WITH BOM, otherwise csc decodes Chinese as GBK ---
 # v1.1: 编译源 = 主程序 + 拆分出的模块文件（全部转 BOM 后传入 csc）
 $sourceFiles = @(
-    (Join-Path $scriptDir 'DshLauncher.cs'),
-    (Join-Path $scriptDir 'LauncherConfig.cs'),
-    (Join-Path $scriptDir 'LauncherLog.cs'),
-    (Join-Path $scriptDir 'LauncherCore.cs'),
-    (Join-Path $scriptDir 'ModeGate.cs')
+    (Join-Path $srcDir 'DshLauncher.cs'),
+    (Join-Path $srcDir 'LauncherConfig.cs'),
+    (Join-Path $srcDir 'LauncherLog.cs'),
+    (Join-Path $srcDir 'LauncherCore.cs'),
+    (Join-Path $srcDir 'ModeGate.cs'),
+    (Join-Path $srcDir 'RescueMode.cs')
 )
 $tmpSources = @()
 $bom = [byte[]](0xEF, 0xBB, 0xBF)
@@ -177,7 +196,7 @@ $mainLnk = Join-Path $desktop 'DeepSeek Harness.lnk'
 $lnk = $sh.CreateShortcut($mainLnk)
 $lnk.TargetPath = $out
 $lnk.Arguments = '--open'
-$lnk.WorkingDirectory = $scriptDir
+$lnk.WorkingDirectory = $rootDir
 $lnk.IconLocation = "$mainIcon,0"
 $lnk.Save()
 Write-Host "[5/5] shortcut: $mainLnk  ->  $out --open"
@@ -192,7 +211,7 @@ Get-ChildItem -LiteralPath $desktop -Filter *.lnk | ForEach-Object {
 
 Write-Host ''
 Write-Host 'Build OK. Double-click desktop "DeepSeek Harness" to launch.'
-$logDir = Join-Path $scriptDir 'logs'
+$logDir = Join-Path $rootDir 'logs'
 Write-Host "Logs: $logDir"
 
 if (-not $NoPause) { Read-Host 'Press Enter to close' }

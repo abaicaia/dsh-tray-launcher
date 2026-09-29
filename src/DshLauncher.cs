@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
@@ -25,7 +25,6 @@ using System.Windows.Forms;
 //    --status / --selftest  诊断报告 -> logs\status.txt / logs\selftest.txt
 //    --port N             覆盖端口 (默认 3080)
 //    --help               帮助
-//  配置文件: <数据目录>\dsh-launcher.conf   (port=... / dsh_home=...)
 // ============================================================================
 namespace DshLauncher
 {
@@ -235,6 +234,20 @@ namespace DshLauncher
             menu.Items.Add("打开 DSH 界面", null, delegate { EnsureRunningAndOpenUi(); });
             menu.Items.Add("重启 DSH（清理旧进程）", null, delegate { RestartDsh(); });
             menu.Items.Add("叫小D来修（界面打不开时）", null, delegate { LauncherCore.OpenAskXiaoD(); });
+            menu.Items.Add(new ToolStripSeparator());
+            // —— v1.2 救援模式（设计见 v2-救援模式设计-20260929.md）——
+            ToolStripMenuItem rescue = new ToolStripMenuItem("救援（DSH 出问题时用这里）");
+            rescue.DropDownItems.Add("收集现场（诊断简报，只读）", null, delegate { RescueMode.CollectBrief(); });
+            rescue.DropDownItems.Add("救援建议（读最近简报）", null, delegate { RescueMode.Diagnose(); });
+            rescue.DropDownItems.Add("救援验收（8 项清单）", null, delegate { RescueMode.Verify(); });
+            rescue.DropDownItems.Add("体检：农场链接（只读）", null, delegate { RescueMode.ScanFarm(); });
+            rescue.DropDownItems.Add("体检：可用快照 / 补丁状态", null, delegate { RescueMode.ListSnapshots(); });
+            rescue.DropDownItems.Add("补丁状态（dry-run）", null, delegate { RescueMode.ReapplyPatches(); });
+            rescue.DropDownItems.Add(new ToolStripSeparator());
+            rescue.DropDownItems.Add("进入安全模式（跳过用户插件）", null, delegate { RescueMode.EnterSafeMode(); });
+            rescue.DropDownItems.Add("退出安全模式（回正常 3080）", null, delegate { RescueMode.ExitSafeMode(); });
+            menu.Items.Add(rescue);
+            menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add("停止 DSH", null, delegate { StopDshTray(); });
             menu.Items.Add("查看日志", null, delegate { try { Process.Start(LauncherConfig.LogDir); } catch { } });
             menu.Items.Add(new ToolStripSeparator());
@@ -391,6 +404,19 @@ namespace DshLauncher
                 else if (a.StartsWith("--") && opt.Mode == "") opt.Mode = a;
             }
 
+            // ---- v1.2 救援模式命令行入口（与托盘菜单一一对应）----
+            // ★ 必须放在 mutex 判断**之前**：救援命令的用意正是"任何情况下都能跑"。
+            //   2026-09-29 实测踩到：放进 if (!created) 块里之后，没有托盘在跑时它会掉进"新建托盘"分支 ——
+            //   日志显示 模式=--rescue-verify 紧接着 托盘启动: DSH 已在运行，救援动作根本没执行。
+            if (opt.Mode == "--rescue-brief")     { RescueMode.CliBrief(); return; }
+            if (opt.Mode == "--rescue-diagnose")  { RescueMode.CliDiagnose(); return; }
+            if (opt.Mode == "--rescue-verify")    { RescueMode.CliVerify(); return; }
+            if (opt.Mode == "--rescue-scan")      { RescueMode.CliScanFarm(); return; }
+            if (opt.Mode == "--rescue-snapshots") { RescueMode.CliSnapshots(); return; }
+            if (opt.Mode == "--rescue-patches")   { RescueMode.CliPatches(); return; }
+            if (opt.Mode == "--rescue-enter")     { RescueMode.CliEnterSafe(); return; }
+            if (opt.Mode == "--rescue-exit")      { RescueMode.CliExitSafe(); return; }
+
             bool created;
             Mutex mutex = new Mutex(true, "Local\\DSHLauncher-" + Environment.UserName, out created);
             try
@@ -406,6 +432,7 @@ namespace DshLauncher
                     if (opt.Mode == "--selftest") { LauncherCore.WriteSelfTestFile(); return; }
                     // 急救入口与托盘的管道无关：直接在本进程弹新控制台窗口，不必转发
                     if (opt.Mode == "--ask") { LauncherCore.OpenAskXiaoD(); return; }
+
                     string cmd = "open";
                     if (opt.Mode == "--restart") cmd = "restart";
                     else if (opt.Mode == "--stop") cmd = "stop";

@@ -1,4 +1,4 @@
-using System.Reflection;
+﻿using System.Reflection;
 [assembly: AssemblyTitle("DSH Launcher")]
 [assembly: AssemblyDescription("DeepSeek Harness system tray launcher: one-click open, auto-clean and restart on failure, full logging")]
 [assembly: AssemblyCompany("DSHLauncher")]

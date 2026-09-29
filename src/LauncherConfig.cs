@@ -1,16 +1,24 @@
-using System;
+﻿using System;
 using System.IO;
 using System.Reflection;
 
 namespace DshLauncher
 {
     /// <summary>
-    /// 配置与路径族：数据目录解析、dsh-launcher.conf 读取、node/DSH/Chrome 路径探测。
+    /// 配置与路径族：数据目录解析、node/DSH/Chrome 路径探测。
     /// v1.1 重构：从 Program 原样搬出（行为零变化）。
     /// </summary>
     internal static class LauncherConfig
     {
         public const int DefaultPort = 3080;
+
+        // ---- v1.2 救援模式 ----
+        /// <summary>救援实例端口：与主端口分开，安全模式实例跑这里。</summary>
+        public const int RescuePort = 3090;
+        /// <summary>救援工具目录（collect-rescue-brief.mjs / rescue-fix.mjs 所在）。</summary>
+        public static string ToolsDir = @"J:\2\gonzuo\tools";
+        /// <summary>安全模式开关的环境变量名（必须与 cordis.patch.yml 里 !!js 表达式的变量名一致）。</summary>
+        public const string SafeModeEnv = "DSH_SAFE_MODE";
         public const string PwaAppId = "hgiemfgfjhalibdoboikeiepnnjapnpc";
 
         public static readonly string ExeDir =
@@ -21,18 +29,20 @@ namespace DshLauncher
         /// <summary>当前端口（conf 或 --port 覆盖，启动后不变）。</summary>
         public static int Port = DefaultPort;
 
-        private static string ConfigDshHome;
-
         public static string LauncherLog { get { return Path.Combine(LogDir, "launcher.log"); } }
         public static string StatusFile { get { return Path.Combine(LogDir, "status.txt"); } }
         public static string SelfTestFile { get { return Path.Combine(LogDir, "selftest.txt"); } }
-        public static string ConfigFile { get { return Path.Combine(DataDir, "dsh-launcher.conf"); } }
         public static string PidFile { get { return Path.Combine(DataDir, "dsh-web-" + Port + ".pid"); } }
         public static string StdoutLog { get { return Path.Combine(LogDir, "dsh-web-" + Port + ".stdout.log"); } }
         public static string StderrLog { get { return Path.Combine(LogDir, "dsh-web-" + Port + ".stderr.log"); } }
 
         /// <summary>托盘图标提示文案用的地址。</summary>
         public static string Url { get { return "http://127.0.0.1:" + Port; } }
+
+        /// <summary>按指定端口算文件路径（救援实例用，避免覆盖主端口那份）。</summary>
+        public static string PidFileFor(int port) { return Path.Combine(DataDir, "dsh-web-" + port + ".pid"); }
+        public static string StdoutLogFor(int port) { return Path.Combine(LogDir, "dsh-web-" + port + ".stdout.log"); }
+        public static string StderrLogFor(int port) { return Path.Combine(LogDir, "dsh-web-" + port + ".stderr.log"); }
 
         /// <summary>
         /// 数据目录优先 exe 旁（可写时），否则 %LOCALAPPDATA%\DSHLauncher。
@@ -55,33 +65,6 @@ namespace DshLauncher
             }
         }
 
-        public static void LoadConfig()
-        {
-            try
-            {
-                string conf = ConfigFile;
-                if (!File.Exists(conf)) return;
-                foreach (string raw in File.ReadAllLines(conf, System.Text.Encoding.UTF8))
-                {
-                    string line = raw.Trim();
-                    if (line.Length == 0 || line.StartsWith("#") || line.StartsWith(";")) continue;
-                    int eq = line.IndexOf('=');
-                    if (eq <= 0) continue;
-                    string key = line.Substring(0, eq).Trim().ToLowerInvariant();
-                    string val = line.Substring(eq + 1).Trim().Trim('"');
-                    if (key == "port")
-                    {
-                        int p;
-                        if (int.TryParse(val, out p) && p > 0 && p < 65536) Port = p;
-                    }
-                    else if (key == "dsh_home")
-                    {
-                        ConfigDshHome = val;
-                    }
-                }
-            }
-            catch { }
-        }
 
         public static string NodeExe
         {
@@ -108,7 +91,6 @@ namespace DshLauncher
         {
             get
             {
-                if (!string.IsNullOrEmpty(ConfigDshHome)) return ConfigDshHome;
                 string h = Environment.GetEnvironmentVariable("DSH_HOME");
                 if (!string.IsNullOrEmpty(h)) return h;
                 return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".dsh");
