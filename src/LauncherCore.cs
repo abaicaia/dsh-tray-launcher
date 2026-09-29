@@ -551,7 +551,7 @@ namespace DshLauncher
         {
             StringBuilder sb = new StringBuilder();
             sb.AppendLine("DSH Launcher 状态检查   时间: " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"));
-            sb.AppendLine("版本: 1.1.0");
+            sb.AppendLine("版本: 1.2.0");
             sb.AppendLine("执行目录: " + LauncherConfig.ExeDir);
             sb.AppendLine("数据目录: " + LauncherConfig.DataDir);
             sb.AppendLine("端口: " + LauncherConfig.Port + "   URL: " + LauncherConfig.Url);
@@ -639,7 +639,7 @@ namespace DshLauncher
         public static void WriteHelp()
         {
             string help =
-"DSH Launcher - DeepSeek Harness 系统托盘启动器 (v1.1.0)\n" +
+"DSH Launcher - DeepSeek Harness 系统托盘启动器 (v1.2.0)\n" +
 "\n" +
 "用法: DshLauncher.exe [选项]\n" +
 "  (无参数)               启动托盘; DSH 未运行则自动清理并启动\n" +

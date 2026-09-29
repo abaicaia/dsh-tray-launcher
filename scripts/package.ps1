@@ -9,7 +9,7 @@ $rootDir = Split-Path $scriptDir -Parent
 if (-not (Test-Path (Join-Path $rootDir 'src'))) { $rootDir = $scriptDir }
 $srcDir   = if (Test-Path (Join-Path $rootDir 'src'))    { Join-Path $rootDir 'src' }    else { $rootDir }
 $assetDir = if (Test-Path (Join-Path $rootDir 'assets')) { Join-Path $rootDir 'assets' } else { $rootDir }
-$version = '1.0.0'
+$version = '1.2.0'
 $stage = Join-Path $rootDir ('release\DSHLauncher-v' + $version)
 if (Test-Path $stage) { Remove-Item -LiteralPath $stage -Recurse -Force }
 New-Item -ItemType Directory -Force -Path $stage | Out-Null

@@ -4,5 +4,5 @@
 [assembly: AssemblyCompany("DSHLauncher")]
 [assembly: AssemblyProduct("DSH Launcher")]
 [assembly: AssemblyCopyright("Copyright (c) 2026 DSHLauncher Authors. MIT License.")]
-[assembly: AssemblyVersion("1.0.0.0")]
-[assembly: AssemblyFileVersion("1.0.0.0")]
+[assembly: AssemblyVersion("1.2.0.0")]
+[assembly: AssemblyFileVersion("1.2.0.0")]
